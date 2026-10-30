@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       dxvk_tag:
-        description: "DXVK tag to build (example: v2.7 or v3.1.1)"
-        default: "v2.7"
+        description: "DXVK tag to build (example: v2.7.1 or v3.1.1)"
+        default: "v2.7.1"
         required: true
 
 jobs:
@@ -18,8 +18,23 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build glslang-tools zip unzip git python3-pip
+          sudo apt-get install -y ninja-build glslang-tools zip unzip git python3-pip pkg-config cmake
           pip install --break-system-packages meson
+
+      - name: Build SDL2 for Android (DXVK needs it)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          git clone --depth 1 --branch release-2.30.9 https://github.com/libsdl-org/SDL.git sdl-src
+          cmake -S sdl-src -B sdl-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/sdl-install"
+          cmake --build sdl-build
+          cmake --install sdl-build
+          echo "=== SDL2 install ==="
+          find sdl-install -name 'libSDL2*' -o -name 'sdl2.pc'
 
       - name: Get DXVK source
         run: |
@@ -27,8 +42,6 @@ jobs:
           cd dxvk
           git checkout "${{ github.event.inputs.dxvk_tag }}"
           git submodule update --init --recursive
-          echo "=== meson options in this version ==="
-          cat meson_options.txt
 
       - name: Apply optional patches (put *.patch files in a patches/ folder)
         run: |
@@ -41,24 +54,24 @@ jobs:
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          SDLPC="$(dirname "$(find $PWD/sdl-install -name sdl2.pc | head -1)")"
           cd dxvk
-          cat > android-arm64.txt <<CF
-          [binaries]
-          c   = '$TC/aarch64-linux-android29-clang'
-          cpp = '$TC/aarch64-linux-android29-clang++'
-          ar  = '$TC/llvm-ar'
-          strip = '$TC/llvm-strip'
-          [host_machine]
-          system = 'android'
-          cpu_family = 'aarch64'
-          cpu = 'aarch64'
-          endian = 'little'
-          [built-in options]
-          c_link_args   = ['-static-libstdc++']
-          cpp_link_args = ['-static-libstdc++']
-          CF
-          # sed removes the YAML indentation from the heredoc
-          sed -i 's/^          //' android-arm64.txt
+          {
+            echo "[binaries]"
+            echo "c = '$TC/aarch64-linux-android29-clang'"
+            echo "cpp = '$TC/aarch64-linux-android29-clang++'"
+            echo "ar = '$TC/llvm-ar'"
+            echo "strip = '$TC/llvm-strip'"
+            echo "pkg-config = 'pkg-config'"
+            echo "[host_machine]"
+            echo "system = 'android'"
+            echo "cpu_family = 'aarch64'"
+            echo "cpu = 'aarch64'"
+            echo "endian = 'little'"
+            echo "[properties]"
+            echo "pkg_config_libdir = ['$SDLPC']"
+          } > android-arm64.txt
+          cat android-arm64.txt
 
           OPTS=""
           add() { grep -q "option('$1'" meson_options.txt && OPTS="$OPTS -D$1=$2" || true; }
@@ -78,6 +91,7 @@ jobs:
           mkdir -p ../out
           cp "$(find build-android -name 'libdxvk_d3d9.so' | head -1)" ../out/libdxvk_d3d9.so
           ls -l ../out
+          readelf -d ../out/libdxvk_d3d9.so | grep NEEDED || true
 
       - name: Repack APK (only if PrototypeMainUp.apk is in the repo)
         run: |

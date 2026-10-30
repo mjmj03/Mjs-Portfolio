@@ -1,0 +1,102 @@
+name: Build DXVK for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      dxvk_tag:
+        description: "DXVK tag to build (example: v2.7 or v3.1.1)"
+        default: "v2.7"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout this repo (for optional APK and patches)
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools zip unzip git python3-pip
+          pip install --break-system-packages meson
+
+      - name: Get DXVK source
+        run: |
+          git clone --recursive https://github.com/doitsujin/dxvk.git
+          cd dxvk
+          git checkout "${{ github.event.inputs.dxvk_tag }}"
+          git submodule update --init --recursive
+          echo "=== meson options in this version ==="
+          cat meson_options.txt
+
+      - name: Apply optional patches (put *.patch files in a patches/ folder)
+        run: |
+          cd dxvk
+          for p in ../patches/*.patch; do
+            [ -f "$p" ] && { echo "Applying $p"; git apply "$p"; }
+          done || true
+
+      - name: Build libdxvk_d3d9.so (Android arm64)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cd dxvk
+          cat > android-arm64.txt <<CF
+          [binaries]
+          c   = '$TC/aarch64-linux-android29-clang'
+          cpp = '$TC/aarch64-linux-android29-clang++'
+          ar  = '$TC/llvm-ar'
+          strip = '$TC/llvm-strip'
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          [built-in options]
+          c_link_args   = ['-static-libstdc++']
+          cpp_link_args = ['-static-libstdc++']
+          CF
+          # sed removes the YAML indentation from the heredoc
+          sed -i 's/^          //' android-arm64.txt
+
+          OPTS=""
+          add() { grep -q "option('$1'" meson_options.txt && OPTS="$OPTS -D$1=$2" || true; }
+          add native_sdl2 enabled
+          add native_glfw disabled
+          add native_sdl3 disabled
+          add enable_d3d8 false
+          add enable_d3d10 false
+          add enable_d3d11 false
+          add enable_dxgi false
+          add enable_d3d9 true
+          add enable_tests false
+          echo "Using options: $OPTS"
+
+          meson setup build-android --cross-file android-arm64.txt --buildtype release -Dstrip=true $OPTS
+          ninja -C build-android
+          mkdir -p ../out
+          cp "$(find build-android -name 'libdxvk_d3d9.so' | head -1)" ../out/libdxvk_d3d9.so
+          ls -l ../out
+
+      - name: Repack APK (only if PrototypeMainUp.apk is in the repo)
+        run: |
+          [ -f PrototypeMainUp.apk ] || { echo "No APK in repo, skipping repack."; exit 0; }
+          BT="$ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)"
+          W=$(mktemp -d)
+          cp PrototypeMainUp.apk $W/in.apk
+          mkdir -p $W/lib/arm64-v8a && cp out/libdxvk_d3d9.so $W/lib/arm64-v8a/
+          zip -q -d $W/in.apk 'META-INF/*' 'lib/arm64-v8a/libdxvk_d3d9.so' || true
+          (cd $W && zip -q -0 -X in.apk lib/arm64-v8a/libdxvk_d3d9.so)
+          $BT/zipalign -f -p 4 $W/in.apk $W/aligned.apk
+          keytool -genkeypair -keystore $W/ks.jks -storepass android -keypass android \
+            -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android"
+          $BT/apksigner sign --ks $W/ks.jks --ks-pass pass:android --key-pass pass:android \
+            --out out/PrototypeMainUp-dxvk.apk $W/aligned.apk
+          $BT/apksigner verify out/PrototypeMainUp-dxvk.apk && echo "APK OK"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-android
+          path: out/

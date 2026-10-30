@@ -43,6 +43,18 @@ jobs:
           git checkout "${{ github.event.inputs.dxvk_tag }}"
           git submodule update --init --recursive
 
+      - name: Save Vulkan loader source (so the GIPA patch can be written)
+        run: |
+          cd dxvk
+          mkdir -p ../out/loader-src
+          grep -rl 'vkGetInstanceProcAddr' src/vulkan src/wsi src/util 2>/dev/null | while read f; do
+            mkdir -p "../out/loader-src/$(dirname "$f")"
+            cp "$f" "../out/loader-src/$f"
+          done
+          echo "Files saved:"; find ../out/loader-src -type f
+          echo "=== where the log message comes from ==="
+          grep -rn 'Found vkGetInstanceProcAddr' src || true
+
       - name: Apply optional patches (put *.patch files in a patches/ folder)
         run: |
           cd dxvk

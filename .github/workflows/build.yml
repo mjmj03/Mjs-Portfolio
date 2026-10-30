@@ -43,18 +43,6 @@ jobs:
           git checkout "${{ github.event.inputs.dxvk_tag }}"
           git submodule update --init --recursive
 
-      - name: Save Vulkan loader source (so the GIPA patch can be written)
-        run: |
-          cd dxvk
-          mkdir -p ../out/loader-src
-          grep -rl 'vkGetInstanceProcAddr' src/vulkan src/wsi src/util 2>/dev/null | while read f; do
-            mkdir -p "../out/loader-src/$(dirname "$f")"
-            cp "$f" "../out/loader-src/$f"
-          done
-          echo "Files saved:"; find ../out/loader-src -type f
-          echo "=== where the log message comes from ==="
-          grep -rn 'Found vkGetInstanceProcAddr' src || true
-
       - name: Apply optional patches (put *.patch files in a patches/ folder)
         run: |
           cd dxvk
@@ -62,14 +50,100 @@ jobs:
             [ -f "$p" ] && { echo "Applying $p"; git apply "$p"; }
           done || true
 
-      - name: Android patch - use libSDL2.so name
+      - name: Android patches (SDL name, DXVK_VK_GIPA, Android surface)
         run: |
-          cd dxvk
-          echo "Files mentioning the desktop SDL name:"
-          grep -rl 'libSDL2-2.0.so.0' src || true
-          grep -rl 'libSDL2-2.0.so.0' src | xargs -r sed -i 's/libSDL2-2\.0\.so\.0/libSDL2.so/g'
-          echo "After patch:"
-          grep -rn 'libSDL2' src || true
+          cat > android_patch.py <<'PYEOF'
+          import re, sys, pathlib
+          root = pathlib.Path(sys.argv[1])  # dxvk source dir
+
+          def rw(path, fn):
+              p = root / path
+              s = p.read_text()
+              n = fn(s)
+              assert n != s, f"patch made no change: {path}"
+              p.write_text(n)
+              print("patched", path)
+
+          # 1) SDL library name used on Android
+          for p in (root / "src").rglob("*"):
+              if p.suffix in (".cpp", ".h"):
+                  s = p.read_text(errors="ignore")
+                  if "libSDL2-2.0.so.0" in s:
+                      p.write_text(s.replace("libSDL2-2.0.so.0", "libSDL2.so"))
+                      print("SDL name patched in", p)
+
+          # 2) Use the Vulkan loader the app provides through DXVK_VK_GIPA (hex address)
+          def gipa(s):
+              marker = "static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {\n"
+              assert marker in s, "loadVulkanLibrary not found"
+              inject = marker + '''    if (const char* gipaEnv = std::getenv("DXVK_VK_GIPA")) {
+                char* end = nullptr;
+                unsigned long long addr = std::strtoull(gipaEnv, &end, 16);
+                if (addr != 0 && end != gipaEnv) {
+                  Logger::info(str::format("Vulkan: Using vkGetInstanceProcAddr from DXVK_VK_GIPA @ 0x", std::hex, addr));
+                  return std::make_pair(HMODULE(nullptr), reinterpret_cast<PFN_vkGetInstanceProcAddr>(static_cast<uintptr_t>(addr)));
+                }
+                Logger::warn("Vulkan: DXVK_VK_GIPA is set but could not be parsed");
+              }
+          '''
+              s = s.replace(marker, inject)
+              return s.replace("#include <tuple>\n", "#include <tuple>\n#include <cstdlib>\n#include <cstdint>\n", 1)
+          rw("src/vulkan/vulkan_loader.cpp", gipa)
+
+          # 3) Create the surface directly from the Android window, using the app's Vulkan functions
+          def inc(s):
+              return s.replace("#include <SDL.h>\n", "#include <SDL.h>\n#include <SDL_syswm.h>\n", 1)
+          rw("src/wsi/sdl2/wsi_platform_sdl2.h", inc)
+
+          def funcs(s):
+              m = re.search(r"^.*SDL_PROC\([^\n]*SDL_GetWindowSize[^\n]*\n", s, re.M)
+              assert m, "SDL_GetWindowSize line not found in funcs header"
+              add = "SDL_PROC(SDL_bool, SDL_GetWindowWMInfo, (SDL_Window *window, SDL_SysWMinfo *info))\n"
+              return s[:m.start()] + add + s[m.start():]
+          rw("src/wsi/sdl2/wsi_platform_sdl2_funcs.h", funcs)
+
+          def surf(s):
+              pat = re.compile(r"(VkResult Sdl2WsiDriver::createSurface\([^)]*\)\s*\{)(.*?)(\n  \})", re.S)
+              m = pat.search(s)
+              assert m, "createSurface not found"
+              body = '''
+              SDL_Window* window = fromHwnd(hWindow);
+
+              SDL_SysWMinfo wmInfo;
+              SDL_VERSION(&wmInfo.version);
+
+              if (!SDL_GetWindowWMInfo(window, &wmInfo) || wmInfo.subsystem != SDL_SYSWM_ANDROID) {
+                Logger::err("SDL2 WSI: could not get Android window");
+                return VK_ERROR_SURFACE_LOST_KHR;
+              }
+
+              struct AndroidSurfaceInfo {
+                VkStructureType sType;
+                const void*     pNext;
+                VkFlags         flags;
+                void*           window;
+              };
+              typedef VkResult (VKAPI_PTR *PFN_createAndroidSurface)(
+                VkInstance, const AndroidSurfaceInfo*, const VkAllocationCallbacks*, VkSurfaceKHR*);
+
+              auto createFn = reinterpret_cast<PFN_createAndroidSurface>(
+                pfnVkGetInstanceProcAddr(instance, "vkCreateAndroidSurfaceKHR"));
+
+              if (!createFn) {
+                Logger::err("SDL2 WSI: vkCreateAndroidSurfaceKHR not available");
+                return VK_ERROR_EXTENSION_NOT_PRESENT;
+              }
+
+              AndroidSurfaceInfo info = { };
+              info.sType  = VkStructureType(1000008000); // VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR
+              info.window = wmInfo.info.android.window;
+
+              return createFn(instance, &info, nullptr, pSurface);'''
+              return s[:m.start(2)] + body + s[m.end(2):]
+          rw("src/wsi/sdl2/wsi_window_sdl2.cpp", surf)
+          print("ALL PATCHES OK")
+          PYEOF
+          python3 android_patch.py dxvk
 
       - name: Build libdxvk_d3d9.so (Android arm64)
         run: |
